@@ -16,7 +16,7 @@ Exit codes: 0 PASS, 1 WARN (unsigned or needs a look, nothing malicious-looking)
 """
 import argparse, datetime, json, os, re, subprocess, sys
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 HOME = os.path.expanduser("~")
 CONFIG_PATH = os.environ.get("COMMIT_TRUST_CONFIG", os.path.join(HOME, ".config/commit-trust/config.json"))
 STATE = os.environ.get("COMMIT_TRUST_STATE", os.path.join(HOME, ".local/state/commit-trust"))
@@ -194,6 +194,11 @@ DANGER_PATTERNS = [
     (re.compile(r"\bcreateRequire\s*\(\s*import\.meta\.url\s*\)"), "low", "createRequire in ESM"),
 ]
 HIDDEN_GAP_RE = re.compile(r"[^\s][ \t]{40,}[^\s]")
+# What follows the gap: statements (punctuation or keywords) are what a hidden payload looks like.
+HIDDEN_CODEY_RE = re.compile(r"[;{}()=]|\b(?:function|require|import|eval|var|let|const|new|return|await|exec|spawn)\b")
+SQL_ALIGN_RE = re.compile(r"(?i)(?:AS|FROM|WHERE|AND|OR|ON|JOIN|LEFT|RIGHT|INNER|OUTER|THEN|ELSE|END|WHEN|CASE|DESC|ASC|"
+                          r"NULLS?|NOT|IN|IS|LIKE|ILIKE|BY|GROUP|ORDER|HAVING|LIMIT|OFFSET|UNION|USING|RETURNING|SET|VALUES)\b"
+                          r"(?:\s+(?:\"[^\"]*\"|[A-Za-z_][\w.]*|\*))?\s*,?\s*$")
 
 # Decoders and execution sinks, JS/TS and Python. A loader decodes data and feeds the result to something that
 # executes code or a shell command; the flow check below looks for that, not just both appearing in a file.
@@ -513,9 +518,15 @@ class Analyzer:
                     # Aligned trailing comments and padded string literals are normal; hidden statements are not.
                     if re.match(r"(//|#|/\*|--|;|<!--|['\"`])", tail) or len(tail.strip()) < 8:
                         continue
-                    if True:
-                        add("high", "hidden-code", path, "code after %d spaces: %s" % (m.end() - m.start() - 2, snip(tail, 60)))
+                    # Column-aligned SQL inside query strings (`COUNT(*)::int      AS total,`) is layout, not hiding.
+                    if SQL_ALIGN_RE.match(tail):
+                        continue
+                    gap = m.end() - m.start() - 2
+                    if HIDDEN_CODEY_RE.search(tail):
+                        add("high", "hidden-code", path, "code after %d spaces: %s" % (gap, snip(tail, 60)))
                         break
+                    add("low", "wide-gap", path, "text after %d spaces: %s" % (gap, snip(tail, 40)))
+                    break
 
             # Obfuscation / minified code where it doesn't belong.
             if not MINIFIED_OK_RE.search(path) and not is_doc:
