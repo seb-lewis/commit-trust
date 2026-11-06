@@ -16,7 +16,7 @@ Exit codes: 0 PASS, 1 WARN (unsigned or needs a look, nothing malicious-looking)
 """
 import argparse, datetime, json, os, re, subprocess, sys
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 HOME = os.path.expanduser("~")
 CONFIG_PATH = os.environ.get("COMMIT_TRUST_CONFIG", os.path.join(HOME, ".config/commit-trust/config.json"))
 STATE = os.environ.get("COMMIT_TRUST_STATE", os.path.join(HOME, ".local/state/commit-trust"))
@@ -229,6 +229,24 @@ DANGEROUS_NAMES = {"eval", "function", "exec", "execsync", "execfile", "spawn", 
 HEX_LIT_RE = re.compile(r"['\"`]((?:[0-9a-fA-F]{2}){24,})['\"`]")
 B64_LIT_RE = re.compile(r"['\"`]([A-Za-z0-9+/]{40,}={0,2}|[A-Za-z0-9_-]{60,})['\"`]")
 
+_GIT_ESC = {"n": b"\n", "t": b"\t", '"': b'"', "\\": b"\\", "a": b"\a", "b": b"\b", "f": b"\f", "r": b"\r", "v": b"\v"}
+
+def _git_unquote(s):
+    """Decode a path git printed in C-style quotes ("b/we\\"ird\\tname" or octal UTF-8 escapes); else unchanged."""
+    s = s.rstrip("\n")
+    if len(s) < 2 or not (s.startswith('"') and s.endswith('"')):
+        return s
+    body, out, i = s[1:-1], bytearray(), 0
+    while i < len(body):
+        c = body[i]
+        if c == "\\" and i + 1 < len(body):
+            n = body[i + 1]
+            if n in "01234567" and re.match(r"[0-7]{3}", body[i + 1:i + 4]):
+                out.append(int(body[i + 1:i + 4], 8)); i += 4; continue
+            out += _GIT_ESC.get(n, n.encode()); i += 2; continue
+        out += c.encode("utf-8"); i += 1
+    return out.decode("utf-8", "replace")
+
 # Indirect so this detector's own source doesn't pair a decoder with its subprocess calls and flag itself.
 _FROM_HEX = getattr(bytes, "from" + "hex")
 
@@ -352,9 +370,12 @@ class Analyzer:
             base_args = [parents[0], sha]
         else:
             base_args = ["--root", sha]
-        status = git(self.repo, "diff-tree", "-r", "-M", "--no-commit-id", "--no-ext-diff", "--no-textconv", "--name-status", "-z", *base_args) if len(parents) <= 1 else ""
-        numstat = git(self.repo, "diff-tree", "-r", "-M", "--no-commit-id", "--no-ext-diff", "--no-textconv", "--numstat", *base_args) if len(parents) <= 1 else ""
-        patch = git(self.repo, "diff-tree", "-r", "-M", "-p", "-U0", "--no-commit-id", "--no-ext-diff", "--no-textconv", "--no-color", *base_args)
+        # -a/--text: the repository's own .gitattributes (`*.js binary`, `-diff`) must not hide content from us.
+        # core.quotePath=false keeps non-ASCII names unquoted; anything git still quotes is decoded below.
+        dt = ["-c", "core.quotePath=false", "diff-tree", "-r", "-M", "-a", "--no-commit-id", "--no-ext-diff", "--no-textconv"]
+        status = git(self.repo, *dt, "--name-status", "-z", *base_args) if len(parents) <= 1 else ""
+        numstat = git(self.repo, *dt, "--numstat", "-z", *base_args) if len(parents) <= 1 else ""
+        patch = git(self.repo, *dt, "-p", "-U0", "--no-color", *base_args)
 
         files = {}  # path -> status letter
         parts = [p for p in status.split("\x00") if p != ""]
@@ -366,17 +387,29 @@ class Analyzer:
             else:
                 files[parts[i + 1]] = st[:1]; i += 2
         stats = {}
-        for line in numstat.splitlines():
-            a, d, p = (line.split("\t", 2) + ["", ""])[:3]
-            if "=>" in p:
-                p = re.sub(r"\{[^}]*=> ([^}]*)\}", r"\1", p).split(" => ")[-1]
-            stats[p] = (None if a == "-" else int(a), None if d == "-" else int(d))
+        # numstat -z: "A\tD\tpath\0", or for renames/copies "A\tD\t\0old\0new\0".
+        recs = numstat.split("\x00")
+        i = 0
+        while i < len(recs):
+            rec = recs[i]
+            if not rec.strip():
+                i += 1; continue
+            a, d, p = (rec.split("\t", 2) + ["", ""])[:3]
+            if p == "" and i + 2 < len(recs):
+                p = recs[i + 2]; i += 3
+            else:
+                i += 1
+            try:
+                stats[p] = (None if a == "-" else int(a), None if d == "-" else int(d))
+            except ValueError:
+                continue
 
         added, removed = {}, {}
         cur = None
         for line in patch.splitlines():
             if line.startswith("+++ "):
-                cur = line[6:] if line.startswith("+++ b/") else None
+                p = _git_unquote(line[4:])
+                cur = p[2:] if p.startswith("b/") else None  # "+++ /dev/null" for deletions
                 continue
             if line.startswith("--- ") or line.startswith("diff ") or line.startswith("@@"):
                 continue
@@ -394,10 +427,16 @@ class Analyzer:
             if st == "D":
                 continue
             lines = added.get(path, [])
-            text = "\n".join(lines)
-            low = text.lower()
             ext = ext_of(path)
             base = path.rsplit("/", 1)[-1]
+            # With -a, genuine binary assets show up as byte noise. Skip text rules only when BOTH the extension
+            # and the file's magic bytes say it's that binary type (a NUL byte alone would be an easy evasion).
+            if lines and ext in MAGIC:
+                head = (self.blob(sha, path, limit=64) or b"")[:16]
+                if head and any(head.find(m) != -1 for m in MAGIC[ext]):
+                    lines = []
+            text = "\n".join(lines)
+            low = text.lower()
             # Prose (README, notes) can quote attack patterns; nothing executes it, so code-pattern rules skip it.
             is_doc = ext in DOC_EXT
 
@@ -671,10 +710,24 @@ def metadata_findings(repo, cfg, slug, info, sig):
 
 # ---------------------------------------------------------------- range evaluation
 
-def evaluate(repo, cfg, slug, head, bases, cache, offline=False):
+def cache_tag(cfg):
+    """Detector version + a hash of the effective config: cached results are only reused under the same tag."""
+    import hashlib
+    return VERSION + "+" + hashlib.sha256(json.dumps(cfg, sort_keys=True).encode()).hexdigest()[:12]
+
+def is_ancestor(repo, a, b):
+    return subprocess.run(["git", "-C", repo] + SAFE_GIT + ["merge-base", "--is-ancestor", a, b],
+                          capture_output=True).returncode == 0
+
+def evaluate(repo, cfg, slug, head, bases, cache, offline=False, fresh=False):
     """Commits reachable from head but not from any base, approved commit or previously cleared commit."""
     approved = approvals(slug) if slug else set()
-    cleared = [s for s, v in cache.items() if v.get("cleared")]
+    # Cached results and "cleared" boundaries are only valid for the detector version + effective config that
+    # produced them; a config change (new IOC, identity, signer) or an explicit recheck rescans everything.
+    tag = cache_tag(cfg)
+    if fresh:
+        cache.clear()
+    cleared = [s for s, v in cache.items() if v.get("cleared") and v.get("v") == tag]
     stop_args = []
     for s in list(bases) + list(approved) + cleared:
         if git(repo, "rev-parse", "--verify", "--quiet", s + "^{commit}", check=False).strip():
@@ -684,13 +737,13 @@ def evaluate(repo, cfg, slug, head, bases, cache, offline=False):
                inp=("\n".join([head] + stop_args) + "\n").encode()).split()
     truncated = len(revs) > MAX_COMMITS
     revs = revs[:MAX_COMMITS]
-    todo = [s for s in revs if not (cache.get(s) and cache[s].get("v") == VERSION)]
+    todo = [s for s in revs if not (cache.get(s) and cache[s].get("v") == tag)]
     sigs = gh_signatures(slug, todo) if (slug and not offline and todo) else {}
     an = Analyzer(repo, cfg, slug)
     results, by_sha = [], {}
     for sha in revs:
         cached = cache.get(sha)
-        if cached and cached.get("v") == VERSION:
+        if cached and cached.get("v") == tag:
             r = cached["r"]
         else:
             info, cf = an.analyze(sha)
@@ -706,7 +759,7 @@ def evaluate(repo, cfg, slug, head, bases, cache, offline=False):
         r = by_sha[sha]
         clean[sha] = r["verdict"] != "FAIL" and all(clean.get(p, p not in by_sha) for p in r["info"]["parents"])
         if not offline:
-            cache[sha] = {"v": VERSION, "r": r, "cleared": clean[sha]}
+            cache[sha] = {"v": tag, "r": r, "cleared": clean[sha]}
     return results, truncated, approved
 
 def commit_verdict(findings):
@@ -794,10 +847,17 @@ def cmd_check(a, cfg):
     repo = os.path.abspath(a.repo)
     slug = a.slug or local_slug(repo)
     head = git(repo, "rev-parse", "--verify", a.rev + "^{commit}").strip()
+    explicit = bool(a.base)
     bases = a.base or ([local_default_base(repo)] if local_default_base(repo) else [])
     bases = [git(repo, "rev-parse", "--verify", b + "^{commit}").strip() for b in bases if b]
+    if not explicit:
+        # The auto-picked base is origin's default branch. If HEAD is already on it (an up-to-date default
+        # branch, or a fresh clone), that base would exclude everything, including a malicious tip. Fall back
+        # to approvals and earlier clears (or, on first contact, the newest MAX_COMMITS) instead.
+        bases = [b for b in bases if not is_ancestor(repo, head, b)]
     cache = load_commit_cache(slug)
-    results, truncated, _ = evaluate(repo, cfg, slug, head, bases, cache, offline=a.offline)
+    results, truncated, _ = evaluate(repo, cfg, slug, head, bases, cache, offline=a.offline,
+                                     fresh=getattr(a, "recheck", False))
     if not a.offline:
         save_commit_cache(slug, cache)
     v = overall(results, truncated)
@@ -839,7 +899,7 @@ def cmd_ci(a, cfg):
                 res = json.load(f)
         except (OSError, ValueError):
             res = {}
-        if res.get("version") == VERSION:
+        if res.get("version") == cache_tag(cfg):
             print(res["summary"]); return {"PASS": 0, "WARN": 1, "FAIL": 2}[res["verdict"]]
     path = cache_repo(a.slug)
     fetch(path, "+refs/heads/%s:refs/remotes/origin/%s" % (dflt, dflt), a.sha)
@@ -851,7 +911,7 @@ def cmd_ci(a, cfg):
         except GitError:
             pass
     cache = load_commit_cache(a.slug)
-    results, truncated, approved = evaluate(path, cfg, a.slug, a.sha, bases, cache)
+    results, truncated, approved = evaluate(path, cfg, a.slug, a.sha, bases, cache, fresh=a.recheck)
     save_commit_cache(a.slug, cache)
     v = overall(results, truncated)
     if a.sha in approved and v == "FAIL":
@@ -864,7 +924,7 @@ def cmd_ci(a, cfg):
     nwarn = sum(r["verdict"] == "WARN" for r in results)
     summary = "%s %d commit(s) checked, %d FAIL, %d WARN%s" % (v, len(results), len(fails), nwarn, (" | " + " | ".join(top)) if top else "")
     with open(vfile, "w") as f:
-        json.dump({"version": VERSION, "verdict": v, "summary": summary, "time": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "results": results}, f)
+        json.dump({"version": cache_tag(cfg), "verdict": v, "summary": summary, "time": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "results": results}, f)
     if a.status:
         state = "failure" if v == "FAIL" else "success"
         desc = ("Blocked: suspicious commits. Run: commit-trust ci --slug %s --sha %s --recheck" % (a.slug, a.sha[:12])) if v == "FAIL" else ("%d commit(s) ok%s" % (len(results), ", %d unsigned/needs a look" % nwarn if nwarn else ""))
