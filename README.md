@@ -119,6 +119,18 @@ Optional. Use `~/.config/commit-trust/config.json`, or inline JSON in `COMMIT_TR
 - `allowed_tz`: committer UTC offsets you actually use. Leave it empty to turn the timezone rule off.
 - `trusted_signers`: GitHub logins whose signatures count as trusted.
 
+## Historical incidents that were cleaned up
+A bad commit deep in your default branch's history would otherwise block every local `gate` on that branch forever, even after the attack was removed. History can't be rewritten without force-pushing.
+
+When you `gate` a commit that's already on origin's default branch, a FAIL commit X in its history is reported as `remediated-history` (WARN) instead of FAIL, but **only** if the CLI proves all of these:
+- X is already on origin's default branch, is history of the HEAD being checked, and isn't HEAD itself. Unpushed local commits never qualify.
+- X's only metadata findings are the forgery kind (copied PR title, identity, timezone). An invalid signature never qualifies.
+- None of the file versions X introduced exist anywhere in HEAD's tree, so moved or copied payloads still count as present.
+- Each path X flagged is either gone at HEAD, or its full current content re-checks clean (for example, reverted to the pre-attack version).
+- No other FAIL commit sits in the range. A reintroduced payload is its own FAIL.
+
+The result is re-proved on every run against the current HEAD and is never cached. It only applies to local `gate`/`check` on the default branch. The `ci` gate, the Actions step and `pr` judge new pushes and PRs exactly as before. It's not an approval mechanism: `approve` and `COMMIT_TRUST_APPROVED` remain the only overrides.
+
 ## Range and caching
 - **Branches and PRs:** commits that aren't on the default branch.
 - **Default branch:** everything since the last cleared or approved commit.

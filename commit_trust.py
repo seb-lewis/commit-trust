@@ -16,7 +16,7 @@ Exit codes: 0 PASS, 1 WARN (unsigned or needs a look, nothing malicious-looking)
 """
 import argparse, datetime, json, os, re, subprocess, sys
 
-VERSION = "1.4.1"
+VERSION = "1.4.4"
 HOME = os.path.expanduser("~")
 CONFIG_PATH = os.environ.get("COMMIT_TRUST_CONFIG", os.path.join(HOME, ".config/commit-trust/config.json"))
 STATE = os.environ.get("COMMIT_TRUST_STATE", os.path.join(HOME, ".local/state/commit-trust"))
@@ -194,6 +194,11 @@ DANGER_PATTERNS = [
     (re.compile(r"\bcreateRequire\s*\(\s*import\.meta\.url\s*\)"), "low", "createRequire in ESM"),
 ]
 HIDDEN_GAP_RE = re.compile(r"[^\s][ \t]{40,}[^\s]")
+# What follows the gap: statements (punctuation or keywords) are what a hidden payload looks like.
+HIDDEN_CODEY_RE = re.compile(r"[;{}()=]|\b(?:function|require|import|eval|var|let|const|new|return|await|exec|spawn)\b")
+SQL_ALIGN_RE = re.compile(r"(?i)(?:AS|FROM|WHERE|AND|OR|ON|JOIN|LEFT|RIGHT|INNER|OUTER|THEN|ELSE|END|WHEN|CASE|DESC|ASC|"
+                          r"NULLS?|NOT|IN|IS|LIKE|ILIKE|BY|GROUP|ORDER|HAVING|LIMIT|OFFSET|UNION|USING|RETURNING|SET|VALUES)\b"
+                          r"(?:\s+(?:\"[^\"]*\"|[A-Za-z_][\w.]*|\*))?\s*,?\s*$")
 
 # Decoders and execution sinks, JS/TS and Python. A loader decodes data and feeds the result to something that
 # executes code or a shell command; the flow check below looks for that, not just both appearing in a file.
@@ -268,31 +273,41 @@ def _decoded_flows_into_exec(text):
     """Light data flow: a decoder's result reaches a code/command-executing call, either in the same call
     expression on one line, or through variables assigned from a decoder (one or two hops)."""
     lines = text.split("\n")
+    # Variables are tracked in code only: `'--regid=1000'` inside a string literal is not an assignment and
+    # `regid` there is not a variable. Decoders/sinks are still matched on the full line (embedded scripts).
+    codes = [_blank_strings(ln) for ln in lines]
     tainted = set()
     for _ in range(2):  # second pass picks up y = f(x) where x was tainted later in the file
-        for ln in lines:
+        for ln, code in zip(lines, codes):
             d = DECODER_RE.search(ln)
             src_pos = d.start() if d else None
             if src_pos is None and tainted:
                 for v in tainted:
-                    m = re.search(r"(?<![\w$.])%s(?![\w$])" % re.escape(v), ln)
-                    if m and ASSIGN_RE.search(ln[:m.start()]):
+                    m = re.search(r"(?<![\w$.])%s(?![\w$])" % re.escape(v), code)
+                    if m and ASSIGN_RE.search(code[:m.start()]):
                         src_pos = m.start(); break
             if src_pos is None:
                 continue
-            targets = ASSIGN_RE.findall(ln[:src_pos])
+            targets = ASSIGN_RE.findall(code[:src_pos])
             if targets:
                 tainted.add(targets[-1])
-    for ln in lines:
+    for ln, code in zip(lines, codes):
         for m in EXEC_CALL_RE.finditer(ln):
             rest = ln[m.end():]
             d = DECODER_RE.search(rest)
             if d:
                 return "%s...%s" % (snip(m.group(0), 20), snip(d.group(0), 24))
+            rest_code = code[m.end():]
             for v in tainted:
-                if re.search(r"(?<![\w$.])%s(?![\w$])" % re.escape(v), rest[:400]):
+                if re.search(r"(?<![\w$.])%s(?![\w$])" % re.escape(v), rest_code[:400]):
                     return "%s%s) with %s from a decoder" % (snip(m.group(0), 20), v, v)
     return None
+
+_STRING_LIT_RE = re.compile(r"'(?:\\.|[^'\\\n])*'|\"(?:\\.|[^\"\\\n])*\"|`(?:\\.|[^`\\\n])*`")
+
+def _blank_strings(ln):
+    """Same-length copy of a line with the contents of quoted string literals replaced by spaces."""
+    return _STRING_LIT_RE.sub(lambda m: m.group(0)[0] + " " * (len(m.group(0)) - 2) + m.group(0)[-1], ln)
 
 def encoded_payload_findings(text, iocs):
     """(sev, rule, detail) tuples for encoded/decoded execution, independent of the encoding used."""
@@ -344,6 +359,17 @@ class Analyzer:
     def exists(self, rev, path):
         return subprocess.run(["git", "-C", self.repo] + SAFE_GIT + ["cat-file", "-e", "%s:%s" % (rev, path)],
                               capture_output=True).returncode == 0
+
+    def whole_file_findings(self, rev, path):
+        """Content findings for `path` at `rev`, treating its entire content as newly added (same rules)."""
+        data = self.blob(rev, path)
+        if data is None:
+            return []
+        found = []
+        def add(sev, rule, p, detail):
+            found.append({"sev": sev, "rule": rule, "file": p, "detail": detail})
+        self._file_rules(rev, [], path, "A", data.decode("utf-8", "replace").split("\n"), {}, {path}, {}, add)
+        return found
 
     def blob(self, rev, path, limit=2_000_000):
         try:
@@ -424,158 +450,167 @@ class Analyzer:
 
         new_files = {p for p, s in files.items() if s == "A"}
         for path, st in sorted(files.items()):
-            if st == "D":
-                continue
-            lines = added.get(path, [])
-            ext = ext_of(path)
-            base = path.rsplit("/", 1)[-1]
-            # With -a, genuine binary assets show up as byte noise. Skip text rules only when BOTH the extension
-            # and the file's magic bytes say it's that binary type (a NUL byte alone would be an easy evasion).
-            if lines and ext in MAGIC:
-                head = (self.blob(sha, path, limit=64) or b"")[:16]
-                if head and any(head.find(m) != -1 for m in MAGIC[ext]):
-                    lines = []
-            text = "\n".join(lines)
-            low = text.lower()
-            # Prose (README, notes) can quote attack patterns; nothing executes it, so code-pattern rules skip it.
-            is_doc = ext in DOC_EXT
-
-            for s in self.ioc:
-                if s in low and not is_doc:
-                    add("high", "known-ioc", path, "contains an indicator string from the 2026-11 attack")
-
-            if EDITOR_RE.search(path):
-                if re.search(r"folderOpen|allowAutomaticTasks|\"runOn\"", text):
-                    add("high", "editor-autorun", path, "editor task that runs automatically when the folder is opened")
-                elif re.search(r"(postCreateCommand|postStartCommand|initializeCommand|postAttachCommand|onCreateCommand)", text):
-                    add("medium", "devcontainer-command", path, "devcontainer lifecycle command added/changed")
-                elif path.endswith((".envrc", ".nvim.lua", ".exrc", ".vimrc")):
-                    add("high", "editor-autorun", path, "file executed automatically by direnv/editor")
-                elif st == "A":
-                    add("low", "editor-config", path, "new editor config file")
-            hook_cfg = base in ("package.json", ".gitconfig", ".npmrc") or ext in CODE_EXT or (ext == "" and not is_doc)
-            # Setting hooksPath to /dev/null disables hooks (what this tool does); pointing it anywhere else enables them.
-            sets_hooks = re.search(r"core\.hooksPath\s*[= ]\s*['\"]?(?!/dev/null)[\w./~$-]", text) or \
-                (base == "package.json" and re.search(r"simple-git-hooks|\"husky\"\s*:", text))
-            if HOOK_PATH_RE.search(path) or (hook_cfg and sets_hooks):
-                add("high", "git-hooks", path, "adds or changes git hooks (run automatically on commit/checkout)")
-            if WORKFLOW_RE.search(path):
-                dangerous = []
-                if "pull_request_target" in text: dangerous.append("pull_request_target")
-                if re.search(r"toJSON\(\s*secrets\s*\)", text): dangerous.append("toJSON(secrets)")
-                if re.search(r"\$\{\{\s*github\.event\.(pull_request|issue|comment|head_commit|review)\.[\w.]*(title|body|message|ref|label)", text):
-                    add("medium", "workflow-injection-risk", path, "untrusted event text (title/body/message) expanded into the workflow; pass it via env instead")
-                if re.search(r"(curl|wget|nc)\s[^\n]*(secrets\.|\$\w*TOKEN|\$\w*SECRET)", text): dangerous.append("sends a secret over the network")
-                if re.search(r"runs-on:\s*\[?\s*['\"]?(ubuntu|windows|macos)-", text):
-                    add("medium", "github-hosted-runner", path, "adds a GitHub-hosted runner (against the no-GitHub-runners policy)")
-                newsec = sorted(set(re.findall(r"secrets\.([A-Z0-9_]+)", text)) - {"GITHUB_TOKEN"})
-                if dangerous:
-                    add("high", "workflow-dangerous", path, "; ".join(dangerous))
-                add("medium", "workflow-change", path, "CI definition changed" + (" (uses secrets: %s)" % ", ".join(newsec[:6]) if newsec else ""))
-            if PKG_CONFIG_RE.search(path):
-                if re.search(r"ignore-scripts\s*=\s*false|enableScripts:\s*true|enable-pre-post-scripts", text):
-                    add("high", "pkg-scripts-enabled", path, "re-enables dependency install scripts")
-                if re.search(r"registry\s*[=:]\s*['\"]?https?://(?!registry\.npmjs\.org|registry\.yarnpkg\.com|npm\.pkg\.github\.com)", text):
-                    add("high", "pkg-registry", path, "points the package manager at a non-default registry")
-                if not (re.search(r"ignore-scripts|registry", text)):
-                    add("low", "pkg-config", path, "package manager config changed")
-            if LOCKFILE_RE.search(path):
-                bad = re.findall(r"(?:resolved|tarball)[\"']?\s*[:=]?\s*[\"']?(https?://[^\s\"',]+)", text)
-                bad = [u for u in bad if not re.match(r"https://(registry\.npmjs\.org|registry\.yarnpkg\.com|npm\.pkg\.github\.com|codeload\.github\.com)/", u)]
-                if bad:
-                    add("high", "lockfile-source", path, "dependency resolved from unusual host: %s" % snip(bad[0], 70))
-                if re.search(r"git\+ssh://|git\+https?://|github:[\w-]+/", text):
-                    add("medium", "lockfile-git-dep", path, "dependency installed straight from a git repo")
-            if base == ".gitignore":
-                gone = [r for r in removed.get(path, []) if re.search(r"\.env|\.dev\.vars|secret|\.pem|\.key|credentials", r, re.I)]
-                gone = [r for r in gone if r.strip() not in {a.strip() for a in lines}]
-                if gone:
-                    add("medium", "gitignore-weakened", path, "stops ignoring: %s" % ", ".join(snip(g, 30) for g in gone[:4]))
-            if base == ".gitmodules":
-                add("medium", "submodule-change", path, "submodule source changed")
-            if base == "package.json":
-                self._package_json(sha, parents, path, add, new_files)
-            if BUILD_CONFIG_RE.search(path):
-                # URLs and process.env are normal in configs (baseURL, test env); process spawning and eval are not.
-                hits = [m for m in (r"child_process", r"\beval\s*\(", r"new\s+Function", r"\bexecSync\s*\(", r"\bspawn(Sync)?\s*\(", r"require\(\s*[^'\"\s)]", r"\bfetch\(\s*['\"]https?://") if re.search(m, text)]
-                if re.search(r"createRequire", text) and (hits or HIDDEN_GAP_RE.search(text)):
-                    hits.append("createRequire")
-                if hits:
-                    add("high", "build-config-code", path, "build/tool config (runs on every dev/build) gains: %s" % ", ".join(h.replace("\\", "") for h in hits[:4]))
-
-            # Code hidden after a long run of spaces (the attack hid payloads past the visible edge).
-            if ext in CODE_EXT or ext == "" or BUILD_CONFIG_RE.search(path) or base == "package.json":
-                for ln in lines:
-                    m = HIDDEN_GAP_RE.search(ln)
-                    if not m or re.match(r"^\s*(//|#|\*|/\*|<!--)", ln) or re.search(r"^\s*\|.*\|\s*$", ln):
-                        continue
-                    tail = ln[m.end() - 1:]
-                    # Aligned trailing comments and padded string literals are normal; hidden statements are not.
-                    if re.match(r"(//|#|/\*|--|;|<!--|['\"`])", tail) or len(tail.strip()) < 8:
-                        continue
-                    if True:
-                        add("high", "hidden-code", path, "code after %d spaces: %s" % (m.end() - m.start() - 2, snip(tail, 60)))
-                        break
-
-            # Obfuscation / minified code where it doesn't belong.
-            if not MINIFIED_OK_RE.search(path) and not is_doc:
-                for rx, need, label in OBF_PATTERNS:
-                    n = len(rx.findall(text))
-                    if n >= need:
-                        add("high", "obfuscated", path, "%s (x%d)" % (label, n))
-                        break
-                longest = max((len(l) for l in lines), default=0)
-                if longest > 1500 and (ext in CODE_EXT or ext == "" or ext not in TEXTISH_NONCODE):
-                    add("medium", "long-line", path, "added line of %d chars (minified/packed code?)" % longest)
-            # Encoding-independent checks: whatever the encoding (hex, base64, char codes, a hand-written
-            # decoder), a payload still has to be decoded and then executed somewhere.
-            if not is_doc and (ext in CODE_EXT or ext in (".json", ".html", ".svg") or ext == "" or BUILD_CONFIG_RE.search(path)):
-                for f_ in encoded_payload_findings(text, self.ioc):
-                    add(f_[0], f_[1], path, f_[2])
-            for rx, sev, label in DANGER_PATTERNS:
-                if (ext in TEXTISH_NONCODE and ext not in (".json", ".yml", ".yaml", ".html")) or re.search(r"(^|/)\.[\w-]*ignore$", path):
-                    continue
-                if rx.search(text):
-                    add(sev, "dangerous-api", path, label)
-
-            # New files: disguised payloads (code in a font/image/odd extension, extensionless scripts).
-            if st == "A":
-                data = self.blob(sha, path)
-                if data is None:
-                    continue
-                if ext in MAGIC:
-                    if len(data) == 0:
-                        add("medium", "fake-asset", path, "empty %s file" % ext)
-                    elif not any(data[:16].find(m) != -1 for m in MAGIC[ext]):
-                        sev = "high" if looks_like_code(data.decode("utf-8", "replace")) else "medium"
-                        add(sev, "fake-asset", path, "%s file whose bytes are not a real %s%s" % (ext, ext, " (contains code)" if sev == "high" else ""))
-                elif ext == ".svg" and re.search(rb"<script|onload\s*=|javascript:", data[:500000], re.I):
-                    add("high", "svg-script", path, "SVG with embedded script")
-                elif ext == "" and base not in KNOWN_EXTENSIONLESS and not base.startswith("."):
-                    txt = data.decode("utf-8", "replace")
-                    if looks_like_code(txt):
-                        in_bin = bool(re.search(r"(^|/)(bin|scripts|tools|hack)/", path)) and txt.startswith("#!")
-                        sev = "medium" if in_bin else ("high" if re.search(r"require\(|child_process|process\.env|import\s", txt) else "medium")
-                        add(sev, "extensionless-script", path, "new extensionless file containing code" + (" (executable in a bin/scripts dir)" if in_bin else ""))
-                elif ext not in CODE_EXT and ext not in TEXTISH_NONCODE and ext not in MAGIC and ext not in (".svg", ".d.ts") and b"\x00" not in data[:4096]:
-                    txt = data.decode("utf-8", "replace")
-                    if looks_like_code(txt) and not re.match(r"\.(cjs|mjs|lua|sql|proto|tf|hcl|nix|dart|swift|scala|ex|exs|erl|hs|ml|clj|r|jl|zig|c|h|cc|cpp|hpp|m)$", ext):
-                        add("high", "disguised-code", path, "code inside a %s file" % (ext or "no-extension"))
-                if len(data) > 5_000_000:
-                    add("low", "large-file", path, "large file added (%d MB)" % (len(data) // 1_000_000))
-
-            # Whole-file rewrites hide small malicious edits inside large "changed every line" diffs.
-            a, d = stats.get(path, (None, None))
-            if st == "M" and a and d and parents and a >= 10 and abs(a - d) <= max(3, a // 5):
-                old = self.blob(parents[0], path, limit=1_000_000) or b""
-                old_lines = old.count(b"\n") + 1
-                if d >= 0.9 * old_lines:
-                    new = self.blob(sha, path, limit=1_000_000) or b""
-                    why = []
-                    if (b"\r\n" in new) != (b"\r\n" in old): why.append("line endings")
-                    if (b"\t" in old) != (b"\t" in new): why.append("tabs/spaces")
-                    add("medium", "whole-file-rewrite", path, "every line rewritten%s; real edits are hidden in the noise" % (" (%s)" % ", ".join(why) if why else ""))
+            self._file_rules(sha, parents, path, st, added.get(path, []), removed, new_files, stats, add)
         return info, f
+
+    def _file_rules(self, sha, parents, path, st, lines, removed, new_files, stats, add):
+        """Content rules for one file of commit `sha`; `lines` are its added lines."""
+        if st == "D":
+            return
+        ext = ext_of(path)
+        base = path.rsplit("/", 1)[-1]
+        # With -a, genuine binary assets show up as byte noise. Skip text rules only when BOTH the extension
+        # and the file's magic bytes say it's that binary type (a NUL byte alone would be an easy evasion).
+        if lines and ext in MAGIC:
+            head = (self.blob(sha, path, limit=64) or b"")[:16]
+            if head and any(head.find(m) != -1 for m in MAGIC[ext]):
+                lines = []
+        text = "\n".join(lines)
+        low = text.lower()
+        # Prose (README, notes) can quote attack patterns; nothing executes it, so code-pattern rules skip it.
+        is_doc = ext in DOC_EXT
+
+        for s in self.ioc:
+            if s in low and not is_doc:
+                add("high", "known-ioc", path, "contains an indicator string from the 2026-11 attack")
+
+        if EDITOR_RE.search(path):
+            if re.search(r"folderOpen|allowAutomaticTasks|\"runOn\"", text):
+                add("high", "editor-autorun", path, "editor task that runs automatically when the folder is opened")
+            elif re.search(r"(postCreateCommand|postStartCommand|initializeCommand|postAttachCommand|onCreateCommand)", text):
+                add("medium", "devcontainer-command", path, "devcontainer lifecycle command added/changed")
+            elif path.endswith((".envrc", ".nvim.lua", ".exrc", ".vimrc")):
+                add("high", "editor-autorun", path, "file executed automatically by direnv/editor")
+            elif st == "A":
+                add("low", "editor-config", path, "new editor config file")
+        hook_cfg = base in ("package.json", ".gitconfig", ".npmrc") or ext in CODE_EXT or (ext == "" and not is_doc)
+        # Setting hooksPath to /dev/null disables hooks (what this tool does); pointing it anywhere else enables them.
+        sets_hooks = re.search(r"core\.hooksPath\s*[= ]\s*['\"]?(?!/dev/null)[\w./~$-]", text) or \
+            (base == "package.json" and re.search(r"simple-git-hooks|\"husky\"\s*:", text))
+        if HOOK_PATH_RE.search(path) or (hook_cfg and sets_hooks):
+            add("high", "git-hooks", path, "adds or changes git hooks (run automatically on commit/checkout)")
+        if WORKFLOW_RE.search(path):
+            dangerous = []
+            if "pull_request_target" in text: dangerous.append("pull_request_target")
+            if re.search(r"toJSON\(\s*secrets\s*\)", text): dangerous.append("toJSON(secrets)")
+            if re.search(r"\$\{\{\s*github\.event\.(pull_request|issue|comment|head_commit|review)\.[\w.]*(title|body|message|ref|label)", text):
+                add("medium", "workflow-injection-risk", path, "untrusted event text (title/body/message) expanded into the workflow; pass it via env instead")
+            if re.search(r"(curl|wget|nc)\s[^\n]*(secrets\.|\$\w*TOKEN|\$\w*SECRET)", text): dangerous.append("sends a secret over the network")
+            if re.search(r"runs-on:\s*\[?\s*['\"]?(ubuntu|windows|macos)-", text):
+                add("medium", "github-hosted-runner", path, "adds a GitHub-hosted runner (against the no-GitHub-runners policy)")
+            newsec = sorted(set(re.findall(r"secrets\.([A-Z0-9_]+)", text)) - {"GITHUB_TOKEN"})
+            if dangerous:
+                add("high", "workflow-dangerous", path, "; ".join(dangerous))
+            add("medium", "workflow-change", path, "CI definition changed" + (" (uses secrets: %s)" % ", ".join(newsec[:6]) if newsec else ""))
+        if PKG_CONFIG_RE.search(path):
+            if re.search(r"ignore-scripts\s*=\s*false|enableScripts:\s*true|enable-pre-post-scripts", text):
+                add("high", "pkg-scripts-enabled", path, "re-enables dependency install scripts")
+            if re.search(r"registry\s*[=:]\s*['\"]?https?://(?!registry\.npmjs\.org|registry\.yarnpkg\.com|npm\.pkg\.github\.com)", text):
+                add("high", "pkg-registry", path, "points the package manager at a non-default registry")
+            if not (re.search(r"ignore-scripts|registry", text)):
+                add("low", "pkg-config", path, "package manager config changed")
+        if LOCKFILE_RE.search(path):
+            bad = re.findall(r"(?:resolved|tarball)[\"']?\s*[:=]?\s*[\"']?(https?://[^\s\"',]+)", text)
+            bad = [u for u in bad if not re.match(r"https://(registry\.npmjs\.org|registry\.yarnpkg\.com|npm\.pkg\.github\.com|codeload\.github\.com)/", u)]
+            if bad:
+                add("high", "lockfile-source", path, "dependency resolved from unusual host: %s" % snip(bad[0], 70))
+            if re.search(r"git\+ssh://|git\+https?://|github:[\w-]+/", text):
+                add("medium", "lockfile-git-dep", path, "dependency installed straight from a git repo")
+        if base == ".gitignore":
+            gone = [r for r in removed.get(path, []) if re.search(r"\.env|\.dev\.vars|secret|\.pem|\.key|credentials", r, re.I)]
+            gone = [r for r in gone if r.strip() not in {a.strip() for a in lines}]
+            if gone:
+                add("medium", "gitignore-weakened", path, "stops ignoring: %s" % ", ".join(snip(g, 30) for g in gone[:4]))
+        if base == ".gitmodules":
+            add("medium", "submodule-change", path, "submodule source changed")
+        if base == "package.json":
+            self._package_json(sha, parents, path, add, new_files)
+        if BUILD_CONFIG_RE.search(path):
+            # URLs and process.env are normal in configs (baseURL, test env); process spawning and eval are not.
+            hits = [m for m in (r"child_process", r"\beval\s*\(", r"new\s+Function", r"\bexecSync\s*\(", r"\bspawn(Sync)?\s*\(", r"require\(\s*[^'\"\s)]", r"\bfetch\(\s*['\"]https?://") if re.search(m, text)]
+            if re.search(r"createRequire", text) and (hits or HIDDEN_GAP_RE.search(text)):
+                hits.append("createRequire")
+            if hits:
+                add("high", "build-config-code", path, "build/tool config (runs on every dev/build) gains: %s" % ", ".join(h.replace("\\", "") for h in hits[:4]))
+
+        # Code hidden after a long run of spaces (the attack hid payloads past the visible edge).
+        if ext in CODE_EXT or ext == "" or BUILD_CONFIG_RE.search(path) or base == "package.json":
+            for ln in lines:
+                m = HIDDEN_GAP_RE.search(ln)
+                if not m or re.match(r"^\s*(//|#|\*|/\*|<!--)", ln) or re.search(r"^\s*\|.*\|\s*$", ln):
+                    continue
+                tail = ln[m.end() - 1:]
+                # Aligned trailing comments and padded string literals are normal; hidden statements are not.
+                if re.match(r"(//|#|/\*|--|;|<!--|['\"`])", tail) or len(tail.strip()) < 8:
+                    continue
+                # Column-aligned SQL inside query strings (`COUNT(*)::int      AS total,`) is layout, not hiding.
+                if SQL_ALIGN_RE.match(tail):
+                    continue
+                gap = m.end() - m.start() - 2
+                if HIDDEN_CODEY_RE.search(tail):
+                    add("high", "hidden-code", path, "code after %d spaces: %s" % (gap, snip(tail, 60)))
+                    break
+                add("low", "wide-gap", path, "text after %d spaces: %s" % (gap, snip(tail, 40)))
+                break
+
+        # Obfuscation / minified code where it doesn't belong.
+        if not MINIFIED_OK_RE.search(path) and not is_doc:
+            for rx, need, label in OBF_PATTERNS:
+                n = len(rx.findall(text))
+                if n >= need:
+                    add("high", "obfuscated", path, "%s (x%d)" % (label, n))
+                    break
+            longest = max((len(l) for l in lines), default=0)
+            if longest > 1500 and (ext in CODE_EXT or ext == "" or ext not in TEXTISH_NONCODE):
+                add("medium", "long-line", path, "added line of %d chars (minified/packed code?)" % longest)
+        # Encoding-independent checks: whatever the encoding (hex, base64, char codes, a hand-written
+        # decoder), a payload still has to be decoded and then executed somewhere.
+        if not is_doc and (ext in CODE_EXT or ext in (".json", ".html", ".svg") or ext == "" or BUILD_CONFIG_RE.search(path)):
+            for f_ in encoded_payload_findings(text, self.ioc):
+                add(f_[0], f_[1], path, f_[2])
+        for rx, sev, label in DANGER_PATTERNS:
+            if (ext in TEXTISH_NONCODE and ext not in (".json", ".yml", ".yaml", ".html")) or re.search(r"(^|/)\.[\w-]*ignore$", path):
+                continue
+            if rx.search(text):
+                add(sev, "dangerous-api", path, label)
+
+        # New files: disguised payloads (code in a font/image/odd extension, extensionless scripts).
+        if st == "A":
+            data = self.blob(sha, path)
+            if data is None:
+                return
+            if ext in MAGIC:
+                if len(data) == 0:
+                    add("medium", "fake-asset", path, "empty %s file" % ext)
+                elif not any(data[:16].find(m) != -1 for m in MAGIC[ext]):
+                    sev = "high" if looks_like_code(data.decode("utf-8", "replace")) else "medium"
+                    add(sev, "fake-asset", path, "%s file whose bytes are not a real %s%s" % (ext, ext, " (contains code)" if sev == "high" else ""))
+            elif ext == ".svg" and re.search(rb"<script|onload\s*=|javascript:", data[:500000], re.I):
+                add("high", "svg-script", path, "SVG with embedded script")
+            elif ext == "" and base not in KNOWN_EXTENSIONLESS and not base.startswith("."):
+                txt = data.decode("utf-8", "replace")
+                if looks_like_code(txt):
+                    in_bin = bool(re.search(r"(^|/)(bin|scripts|tools|hack)/", path)) and txt.startswith("#!")
+                    sev = "medium" if in_bin else ("high" if re.search(r"require\(|child_process|process\.env|import\s", txt) else "medium")
+                    add(sev, "extensionless-script", path, "new extensionless file containing code" + (" (executable in a bin/scripts dir)" if in_bin else ""))
+            elif ext not in CODE_EXT and ext not in TEXTISH_NONCODE and ext not in MAGIC and ext not in (".svg", ".d.ts") and b"\x00" not in data[:4096]:
+                txt = data.decode("utf-8", "replace")
+                if looks_like_code(txt) and not re.match(r"\.(cjs|mjs|lua|sql|proto|tf|hcl|nix|dart|swift|scala|ex|exs|erl|hs|ml|clj|r|jl|zig|c|h|cc|cpp|hpp|m)$", ext):
+                    add("high", "disguised-code", path, "code inside a %s file" % (ext or "no-extension"))
+            if len(data) > 5_000_000:
+                add("low", "large-file", path, "large file added (%d MB)" % (len(data) // 1_000_000))
+
+        # Whole-file rewrites hide small malicious edits inside large "changed every line" diffs.
+        a, d = stats.get(path, (None, None))
+        if st == "M" and a and d and parents and a >= 10 and abs(a - d) <= max(3, a // 5):
+            old = self.blob(parents[0], path, limit=1_000_000) or b""
+            old_lines = old.count(b"\n") + 1
+            if d >= 0.9 * old_lines:
+                new = self.blob(sha, path, limit=1_000_000) or b""
+                why = []
+                if (b"\r\n" in new) != (b"\r\n" in old): why.append("line endings")
+                if (b"\t" in old) != (b"\t" in new): why.append("tabs/spaces")
+                add("medium", "whole-file-rewrite", path, "every line rewritten%s; real edits are hidden in the noise" % (" (%s)" % ", ".join(why) if why else ""))
 
     def _package_json(self, sha, parents, path, add, new_files):
         def load(rev):
@@ -702,11 +737,56 @@ def metadata_findings(repo, cfg, slug, info, sig):
                 same_tree = git(repo, "rev-parse", info["sha"] + "^{tree}").strip() == git(repo, "rev-parse", mcs + "^{tree}").strip()
             except GitError:
                 pass
+            equiv = None
+            if not same_tree:
+                # Content differs, but maybe only in provably meaningless ways from a GitHub-verified real merge
+                # (e.g. a cleanup that re-created the commit and reformatted JSON). Then running it is the same as
+                # running the real merge. Anything else, or an unverified merge, stays a FAIL.
+                try:
+                    msig = gh_signatures(slug, [mcs]).get(mcs)
+                    if msig and msig.get("isValid") and msig.get("wasSignedByGitHub"):
+                        equiv = tree_equivalence(repo, mcs, info["sha"])
+                except (GitError, RuntimeError, OSError, ValueError):
+                    equiv = None
             if same_tree:
                 add("medium", "replayed-metadata", "re-created copy of PR #%s's merge (%s) with identical content" % (mm.group(1), mcs[:8]))
+            elif equiv:
+                add("medium", "replayed-metadata", "re-created copy of PR #%s's GitHub-verified merge (%s); content is equivalent: %s" % (mm.group(1), mcs[:8], equiv))
             else:
                 add("high", "replayed-metadata", "subject copies PR #%s, but that PR merged as %s and this commit's content differs" % (mm.group(1), mcs[:8]))
     return f
+
+IGNORE_FILE_RE = re.compile(r"(^|/)\.(git|docker|npm|prettier|eslint|stylelint|vercel)ignore$")
+
+def tree_equivalence(repo, a, b, max_files=500):
+    """Summary string if trees a and b differ only in ways that cannot change behaviour, else None:
+    JSON files that parse to identical data, other files differing only in blank lines / trailing whitespace /
+    CRLF, and ignore files. Indentation and in-line whitespace still count (Python, YAML, string literals)."""
+    recs = [r for r in git(repo, "-c", "core.quotePath=false", "diff-tree", "-r", "--no-renames", "--name-status", "-z", a, b).split("\x00") if r]
+    if len(recs) % 2 or len(recs) // 2 > max_files:
+        return None
+    n_json = n_blank = n_ignore = 0
+    for st, path in zip(recs[0::2], recs[1::2]):
+        if IGNORE_FILE_RE.search(path):
+            n_ignore += 1
+            continue
+        if st != "M":
+            return None  # files added or removed relative to the real merge
+        xa = git(repo, "cat-file", "blob", "%s:%s" % (a, path), binary=True)
+        xb = git(repo, "cat-file", "blob", "%s:%s" % (b, path), binary=True)
+        if path.endswith(".json"):
+            try:
+                if json.loads(xa) != json.loads(xb):
+                    return None
+            except ValueError:
+                return None
+            n_json += 1
+            continue
+        norm = lambda d: [ln.rstrip() for ln in d.decode("utf-8", "replace").replace("\r\n", "\n").split("\n") if ln.strip()]
+        if norm(xa) != norm(xb):
+            return None
+        n_blank += 1
+    return "%d JSON file(s) reformatted only, %d file(s) with blank-line/trailing-space changes only, %d ignore file(s)" % (n_json, n_blank, n_ignore)
 
 # ---------------------------------------------------------------- range evaluation
 
@@ -761,6 +841,78 @@ def evaluate(repo, cfg, slug, head, bases, cache, offline=False, fresh=False):
         if not offline:
             cache[sha] = {"v": tag, "r": r, "cleared": clean[sha]}
     return results, truncated, approved
+
+# ---------------------------------------------------------------- remediated history (local default-branch gate)
+# A FAIL commit deep in already-published default-branch history (e.g. an attack later cleaned up) would
+# otherwise block every local `gate` on that branch forever. Such a commit is downgraded to WARN only when the
+# CLI can PROVE, against the HEAD being checked, that nothing it introduced survives. Not cached: re-proved per
+# run and per HEAD. Never applies to HEAD itself, to unpushed commits, or in `ci` / `gha` / `pr` modes.
+REMEDIABLE_META = {"replayed-metadata", "identity-forged", "identity-unknown", "identity-name", "timezone"}
+
+def blob_id(repo, rev, path):
+    if not rev:
+        return None
+    out = git(repo, "rev-parse", "--verify", "--quiet", "%s:%s" % (rev, path), check=False).strip()
+    return out or None
+
+def _remediation_proof(an, repo, r, head, default_tip, head_blobs):
+    sha = r["info"]["sha"]
+    if sha == head or not default_tip:
+        return None
+    if not (is_ancestor(repo, sha, default_tip) and is_ancestor(repo, sha, head)):
+        return None  # must be published on origin's default branch and be history of this HEAD
+    highs = [x for x in r["findings"] if x["sev"] == "high"]
+    if not highs or any(not x["file"] and x["rule"] not in REMEDIABLE_META for x in highs):
+        return None  # e.g. an invalid signature is never "remediated"
+    parent = (r["info"].get("parents") or [None])[0]
+    gone = reverted = clean = 0
+    for p in sorted({x["file"] for x in highs if x["file"]}):
+        xb, pb = blob_id(repo, sha, p), blob_id(repo, parent, p)
+        if xb and xb != pb and xb in head_blobs:
+            return None  # the flagged content still exists somewhere in HEAD (same path, renamed or copied)
+        hb = blob_id(repo, head, p)
+        if hb is None:
+            gone += 1
+            continue
+        if any(x["sev"] == "high" for x in an.whole_file_findings(head, p)):
+            return None  # surviving or partially removed payload
+        if pb and hb == pb:
+            reverted += 1
+        else:
+            clean += 1
+    return ("historical FAIL already on the default branch; fixed at HEAD %s (%d path(s) gone, %d reverted to "
+            "pre-attack content, %d re-checked clean)" % (head[:10], gone, reverted, clean))
+
+def remediate_history(repo, cfg, results, head, default_tip):
+    try:
+        tree = git(repo, "ls-tree", "-r", "-z", "--full-tree", head)
+    except GitError:
+        return results  # no proof possible: keep every FAIL
+    head_blobs = set()
+    for ent in tree.split("\x00"):
+        if "\t" in ent:
+            parts = ent.split("\t", 1)[0].split()
+            if len(parts) >= 3:
+                head_blobs.add(parts[2])
+    an, out = Analyzer(repo, cfg), []
+    for r in results:
+        why = None
+        if r["verdict"] == "FAIL":
+            try:
+                why = _remediation_proof(an, repo, r, head, default_tip, head_blobs)
+            except (GitError, OSError, ValueError, RuntimeError, KeyError):
+                why = None  # scan error: stays FAIL
+        if not why:
+            out.append(r)
+            continue
+        r2 = json.loads(json.dumps(r))
+        for x in r2["findings"]:
+            if x["sev"] == "high":
+                x["sev"], x["detail"] = "medium", "[remediated at HEAD] " + x["detail"]
+        r2["findings"].insert(0, {"sev": "medium", "rule": "remediated-history", "file": "", "detail": why})
+        r2["verdict"], r2["remediated"] = "WARN", why
+        out.append(r2)
+    return out
 
 def commit_verdict(findings):
     worst = max((SEV_ORDER[x["sev"]] for x in findings), default=0)
@@ -850,14 +1002,20 @@ def cmd_check(a, cfg):
     explicit = bool(a.base)
     bases = a.base or ([local_default_base(repo)] if local_default_base(repo) else [])
     bases = [git(repo, "rev-parse", "--verify", b + "^{commit}").strip() for b in bases if b]
+    on_default = False
     if not explicit:
         # The auto-picked base is origin's default branch. If HEAD is already on it (an up-to-date default
         # branch, or a fresh clone), that base would exclude everything, including a malicious tip. Fall back
         # to approvals and earlier clears (or, on first contact, the newest MAX_COMMITS) instead.
-        bases = [b for b in bases if not is_ancestor(repo, head, b)]
+        kept = [b for b in bases if not is_ancestor(repo, head, b)]
+        on_default = len(kept) < len(bases)
+        bases = kept
     cache = load_commit_cache(slug)
     results, truncated, _ = evaluate(repo, cfg, slug, head, bases, cache, offline=a.offline,
                                      fresh=getattr(a, "recheck", False))
+    if on_default:
+        # Checking published default-branch history: FAILs the CLI proves are fully fixed at HEAD become WARN.
+        results = remediate_history(repo, cfg, results, head, local_default_base(repo))
     if not a.offline:
         save_commit_cache(slug, cache)
     v = overall(results, truncated)
