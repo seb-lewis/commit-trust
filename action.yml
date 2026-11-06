@@ -1,0 +1,38 @@
+name: commit-trust
+description: >
+  Fail the job before anything runs if the commits this event brings in look malicious (forged identity or
+  timestamps, editor auto-run tasks, hidden or obfuscated loaders, odd install scripts, dangerous workflow
+  changes). Read-only: it fetches history into a temp dir and never checks out or runs repository code.
+  Put it as the FIRST step of every job, pinned by commit SHA.
+inputs:
+  mode:
+    description: "enforce: fail the job on FAIL. warn: report only."
+    default: enforce
+  approved:
+    description: >
+      Space/comma-separated full SHAs a human has reviewed (they and their ancestors are skipped). Pass a repo or
+      org Actions variable, e.g. vars.COMMIT_TRUST_APPROVED: only admins can set it, so a commit can't approve itself.
+    default: ""
+  config:
+    description: >
+      Optional inline JSON config (identities, allowed_tz, trusted_signers, github_signed_only), e.g. from
+      vars.COMMIT_TRUST_CONFIG. See the README.
+    default: ""
+  token:
+    description: Token used to fetch commits and look up signatures / PR merges (read-only use).
+    default: ${{ github.token }}
+outputs:
+  verdict:
+    description: PASS, WARN or FAIL
+    value: ${{ steps.check.outputs.verdict }}
+runs:
+  using: composite
+  steps:
+    - id: check
+      shell: bash
+      env:
+        CT_TOKEN: ${{ inputs.token }}
+        CT_MODE: ${{ inputs.mode }}
+        CT_APPROVED: ${{ inputs.approved }}
+        COMMIT_TRUST_CONFIG_JSON: ${{ inputs.config }}
+      run: bash "$GITHUB_ACTION_PATH/gate.sh"
