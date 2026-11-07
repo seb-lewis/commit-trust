@@ -16,7 +16,7 @@ Exit codes: 0 PASS, 1 WARN (unsigned or needs a look, nothing malicious-looking)
 """
 import argparse, datetime, json, os, re, subprocess, sys
 
-VERSION = "1.4.6"
+VERSION = "1.4.7"
 HOME = os.path.expanduser("~")
 CONFIG_PATH = os.environ.get("COMMIT_TRUST_CONFIG", os.path.join(HOME, ".config/commit-trust/config.json"))
 STATE = os.environ.get("COMMIT_TRUST_STATE", os.path.join(HOME, ".local/state/commit-trust"))
@@ -869,7 +869,7 @@ def evaluate(repo, cfg, slug, head, bases, cache, offline=False, fresh=False):
 # otherwise block every local `gate` on that branch forever. Such a commit is downgraded to WARN only when the
 # CLI can PROVE, against the HEAD being checked, that nothing it introduced survives. Not cached: re-proved per
 # run and per HEAD. Never applies to HEAD itself, to unpushed commits, or in `ci` / `pr` modes; `gha` uses it only
-# when a run re-checks published default-branch history (dispatch/schedule on the default branch).
+# for dispatch/schedule runs, which re-check published default-branch history instead of bringing commits in.
 REMEDIABLE_META = {"replayed-metadata", "identity-forged", "identity-unknown", "identity-name", "timezone"}
 
 def blob_id(repo, rev, path):
@@ -1147,9 +1147,12 @@ def cmd_gha(a, cfg):
             old = git(repo, "rev-parse", "--verify", "--quiet", head + "~20", check=False).strip()
             if old:
                 bases.append(old)
-            # These commits are already published on the default branch rather than brought in by this event, so
-            # (as in the local gate) FAILs the CLI proves are fully fixed at HEAD may become remediated-history WARNs.
-            historical = git(repo, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/%s" % dflt, check=False).strip() or None
+            # A dispatch/schedule run brings in no commits: it re-checks history already published on the default
+            # branch, so (as in the local gate) FAILs the CLI proves are fully fixed at HEAD may become
+            # remediated-history WARNs. A push with an all-zero "before" (branch creation, including the initial
+            # push of the default branch) is introducing these commits, so it keeps full enforcement.
+            if ev_name in ("workflow_dispatch", "schedule"):
+                historical = git(repo, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/%s" % dflt, check=False).strip() or None
     for b in bases:  # a force-push's "before" may not be in the clone
         if not git(repo, "rev-parse", "--verify", "--quiet", b + "^{commit}", check=False).strip():
             git(repo, "fetch", "--quiet", "--no-tags", "origin", b, check=False)
