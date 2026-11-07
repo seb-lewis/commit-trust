@@ -1,10 +1,10 @@
 #!/bin/sh
-# Install commit-trust v1.4.5: downloads commit_trust.py from the GitHub release, checks it against the
+# Install commit-trust v1.4.6: downloads commit_trust.py from the GitHub release, checks it against the
 # SHA-256 below, and installs a `commit-trust` command into $PREFIX/bin (default ~/.local/bin). No sudo.
 # Read this script before running it.
 set -eu
-VERSION="v1.4.5"
-SHA256="605ae08d0063be28843e52d1339bdd310b2f58fd3e211fb656dbeb9783ae8de5"
+VERSION="v1.4.6"
+SHA256="05015ae696510142fe271a15e82d684ac39558067658b611f694507928f23a63"
 REPO="seb-lewis/commit-trust"
 PREFIX="${PREFIX:-$HOME/.local}"
 URL="https://github.com/$REPO/releases/download/$VERSION/commit_trust.py"

@@ -16,7 +16,7 @@ Exit codes: 0 PASS, 1 WARN (unsigned or needs a look, nothing malicious-looking)
 """
 import argparse, datetime, json, os, re, subprocess, sys
 
-VERSION = "1.4.5"
+VERSION = "1.4.6"
 HOME = os.path.expanduser("~")
 CONFIG_PATH = os.environ.get("COMMIT_TRUST_CONFIG", os.path.join(HOME, ".config/commit-trust/config.json"))
 STATE = os.environ.get("COMMIT_TRUST_STATE", os.path.join(HOME, ".local/state/commit-trust"))
@@ -868,7 +868,8 @@ def evaluate(repo, cfg, slug, head, bases, cache, offline=False, fresh=False):
 # A FAIL commit deep in already-published default-branch history (e.g. an attack later cleaned up) would
 # otherwise block every local `gate` on that branch forever. Such a commit is downgraded to WARN only when the
 # CLI can PROVE, against the HEAD being checked, that nothing it introduced survives. Not cached: re-proved per
-# run and per HEAD. Never applies to HEAD itself, to unpushed commits, or in `ci` / `gha` / `pr` modes.
+# run and per HEAD. Never applies to HEAD itself, to unpushed commits, or in `ci` / `pr` modes; `gha` uses it only
+# when a run re-checks published default-branch history (dispatch/schedule on the default branch).
 REMEDIABLE_META = {"replayed-metadata", "identity-forged", "identity-unknown", "identity-name", "timezone"}
 
 def blob_id(repo, rev, path):
@@ -1135,6 +1136,7 @@ def cmd_gha(a, cfg):
         if b: bases.append(b)
     elif ev_name == "push" and ev.get("before") and ev["before"] != zero:
         bases.append(ev["before"])
+    historical = None  # origin's default-branch tip, when this run re-checks already-published history
     if not bases:
         dflt = (ev.get("repository") or {}).get("default_branch") or "main"
         git(repo, "fetch", "--quiet", "--no-tags", "origin", "+refs/heads/%s:refs/remotes/origin/%s" % (dflt, dflt), check=False)
@@ -1145,12 +1147,17 @@ def cmd_gha(a, cfg):
             old = git(repo, "rev-parse", "--verify", "--quiet", head + "~20", check=False).strip()
             if old:
                 bases.append(old)
+            # These commits are already published on the default branch rather than brought in by this event, so
+            # (as in the local gate) FAILs the CLI proves are fully fixed at HEAD may become remediated-history WARNs.
+            historical = git(repo, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/%s" % dflt, check=False).strip() or None
     for b in bases:  # a force-push's "before" may not be in the clone
         if not git(repo, "rev-parse", "--verify", "--quiet", b + "^{commit}", check=False).strip():
             git(repo, "fetch", "--quiet", "--no-tags", "origin", b, check=False)
     bases = [b for b in bases if git(repo, "rev-parse", "--verify", "--quiet", b + "^{commit}", check=False).strip()]
     head = git(repo, "rev-parse", "--verify", head + "^{commit}").strip()
     results, truncated, _ = evaluate(repo, cfg, slug, head, bases, {}, offline=True if not os.environ.get("GH_TOKEN") else False)
+    if historical and is_ancestor(repo, head, historical):
+        results = remediate_history(repo, cfg, results, head, historical)
     v = overall(results, truncated)
     render(results, truncated, v, verbose=a.verbose)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
