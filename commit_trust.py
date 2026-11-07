@@ -16,7 +16,7 @@ Exit codes: 0 PASS, 1 WARN (unsigned or needs a look, nothing malicious-looking)
 """
 import argparse, datetime, json, os, re, subprocess, sys
 
-VERSION = "1.4.4"
+VERSION = "1.4.5"
 HOME = os.path.expanduser("~")
 CONFIG_PATH = os.environ.get("COMMIT_TRUST_CONFIG", os.path.join(HOME, ".config/commit-trust/config.json"))
 STATE = os.environ.get("COMMIT_TRUST_STATE", os.path.join(HOME, ".local/state/commit-trust"))
@@ -729,10 +729,8 @@ def metadata_findings(repo, cfg, slug, info, sig):
         merged, mcs = pr_merge_commit(slug, mm.group(1))
         if merged and mcs and mcs != info["sha"]:
             same_tree = False
-            try:
-                git(repo, "cat-file", "-e", mcs, check=True)
-            except GitError:
-                git(repo, "fetch", "--quiet", "--no-tags", "origin", mcs, check=False)
+            # The real merge is often no longer on any branch (history was rewritten), so it may be missing locally.
+            have_mcs = fetch_object(repo, slug, mcs)
             try:
                 same_tree = git(repo, "rev-parse", info["sha"] + "^{tree}").strip() == git(repo, "rev-parse", mcs + "^{tree}").strip()
             except GitError:
@@ -752,9 +750,33 @@ def metadata_findings(repo, cfg, slug, info, sig):
                 add("medium", "replayed-metadata", "re-created copy of PR #%s's merge (%s) with identical content" % (mm.group(1), mcs[:8]))
             elif equiv:
                 add("medium", "replayed-metadata", "re-created copy of PR #%s's GitHub-verified merge (%s); content is equivalent: %s" % (mm.group(1), mcs[:8], equiv))
+            elif not have_mcs:
+                # Fail closed, but say what actually happened instead of claiming the content differs.
+                add("high", "replayed-metadata", "subject copies PR #%s, whose real merge is %s; that commit could not be fetched, so the content could not be verified (check this repo's git remote access)" % (mm.group(1), mcs[:8]))
             else:
                 add("high", "replayed-metadata", "subject copies PR #%s, but that PR merged as %s and this commit's content differs" % (mm.group(1), mcs[:8]))
     return f
+
+def _fetch(repo, *args):
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", LC_ALL="C")
+    return subprocess.run(["git", "-C", repo] + SAFE_GIT + list(args), capture_output=True, env=env).returncode == 0
+
+def github_https_fetch(repo, slug, *refspecs):
+    """Read-only fetch from github.com over HTTPS using the gh login, for when `origin` is unreachable
+    (e.g. an SSH remote with no working key). Returns True on success."""
+    if not slug:
+        return False
+    return _fetch(repo, "-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential",
+                  "fetch", "--quiet", "--no-tags", "--no-recurse-submodules",
+                  "https://github.com/%s.git" % slug, *refspecs)
+
+def fetch_object(repo, slug, sha):
+    """Make sure commit `sha` is available locally: already present, from origin, or via HTTPS + gh."""
+    if _fetch(repo, "cat-file", "-e", sha + "^{commit}"):
+        return True
+    if _fetch(repo, "fetch", "--quiet", "--no-tags", "--no-recurse-submodules", "origin", sha) or github_https_fetch(repo, slug, sha):
+        return _fetch(repo, "cat-file", "-e", sha + "^{commit}")
+    return False
 
 IGNORE_FILE_RE = re.compile(r"(^|/)\.(git|docker|npm|prettier|eslint|stylelint|vercel)ignore$")
 
@@ -1159,7 +1181,14 @@ def cmd_gate(a, cfg):
         else:
             repo = os.path.abspath(a.repo)
             if not a.no_fetch:
-                git(repo, "fetch", "--quiet", "--no-tags", "--no-recurse-submodules", "origin", check=False)
+                # A stale origin/* makes the base wrong (commits already on the default branch look new), so a
+                # failed fetch must not be silent. Fall back to a read-only HTTPS fetch of the same refs via gh.
+                if not _fetch(repo, "fetch", "--quiet", "--no-tags", "--no-recurse-submodules", "origin"):
+                    slug = local_slug(repo)
+                    if github_https_fetch(repo, slug, "+refs/heads/*:refs/remotes/origin/*"):
+                        print("note: `git fetch origin` failed; refreshed origin/* from https://github.com/%s via gh instead" % slug, file=sys.stderr)
+                    else:
+                        print("WARNING: could not fetch origin; origin/* may be stale, so already-merged commits may be checked as new", file=sys.stderr)
             rc = cmd_check(argparse.Namespace(rev=a.rev, base=a.base, repo=repo, slug=None, offline=False, json=False, verbose=a.verbose), cfg)
     except (GitError, RuntimeError, OSError, ValueError) as e:
         print("commit-trust error: %s" % e, file=sys.stderr)
